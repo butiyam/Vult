@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+// =============================================================================
+// IMPLEMENTATION NOTE — Approach B (BeforeSwapDelta) was used for both buys and
+// sells, not Approach A (mint into reserves + sync/settle). Approach A as
+// described is structurally impossible given the rest of the spec: V4 AMM math
+// is driven by Pool.State.liquidity, not by the manager's ERC20 reserves, so
+// minting tokens into the manager and calling sync/settle does not deepen the
+// curve. Combined with `beforeAddLiquidity` reverting forever, the pool can
+// never have non-zero liquidity, so the AMM cannot price any swap. The hook
+// therefore takes over the entire swap via BeforeSwapDelta and acts as the
+// counterparty: buys mint VULT via the forward curve, sells burn VULT via the
+// inverse curve and pay ETH from the hook's accumulated reserves. The 0.3% LP
+// fee is skimmed by the hook on both directions and accumulated as protocol
+// revenue. Routers must pre-settle the input currency to the PoolManager
+// before calling swap (see VultSwapRouter in the test directory).
+// =============================================================================
+
+import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {Currency} from "v4-core/types/Currency.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
+import {console} from "forge-std/console.sol"; // Add near top imports
+
+import {VultToken} from "./VultToken.sol";
+import {Curve} from "./lib/Curve.sol";
+
+
+/// @title VultHook
+/// @notice The Uniswap V4 hook that mints vult exclusively through a bonding curve.
+///         Buys mint VULT via the forward curve; sells burn VULT via the inverse curve,
+///         priced against accumulated ETH reserves held by this contract.
+/// @dev    See implementation note at the top of this file.
+contract VultHook is IHooks {
+    // ---- locked parameters -------------------------------------------------
+
+    /// @notice Asymptotic supply cap of the curve.
+    uint256 public constant K_SUPPLY = 21_000_000e18;
+
+    /// @notice Curve scale factor (ETH).
+    uint256 public constant S = 150 ether;
+
+    /// @notice Maximum ETH input on a single buy.
+    uint256 public constant MAX_BUY_WEI = 5 ether;
+
+    /// @notice Number of blocks of cooldown between a wallet's last buy and its first sell.
+    uint256 public constant COOLDOWN_BLOCKS = 1;
+
+    /// @notice Pool fee in V4 hundredths-of-bips (3000 = 0.3%).
+    uint24 public constant POOL_FEE = 3000;
+
+    /// @notice Number of blocks during which buys receive an entropy multiplier.
+    uint256 public constant ENTROPY_BLOCKS = 100;
+
+    /// @notice Numerator of the self-deprecation threshold (99/100 of K_SUPPLY).
+    uint256 public constant EXHAUSTION_THRESHOLD_NUMERATOR = 99;
+
+    /// @notice Denominator of the self-deprecation threshold.
+    uint256 public constant EXHAUSTION_THRESHOLD_DENOMINATOR = 100;
+
+    /// @notice LP fee numerator (in 1e6 = 0.3%).
+    uint256 internal constant FEE_NUMERATOR = 30;
+    /// @notice LP fee denominator.
+    uint256 internal constant FEE_DENOMINATOR = 10000;
+
+    // ---- immutables --------------------------------------------------------
+
+    /// @notice The Uniswap V4 PoolManager.
+    IPoolManager public immutable POOL_MANAGER;
+
+    /// @notice The vult ERC-20 token.
+    VultToken public immutable VULT_TOKEN;
+
+    /// @notice The native ETH currency (address(0)).
+    Currency public immutable ETH_CURRENCY;
+
+    /// @notice The vult currency wrapper.
+    Currency public immutable VULT_CURRENCY;
+
+    /// @notice The block at which this hook was deployed.
+    uint256 public immutable GENESIS_BLOCK;
+
+    /// @notice The hash of the block immediately preceding this hook's deployment.
+    bytes32 public immutable GENESIS_HASH;
+
+    // ---- storage -----------------------------------------------------------
+
+    /// @notice The manifesto, eight 32-byte words. Set in constructor; never modified.
+    bytes32[8] private _GENESIS_MESSAGE;
+
+    /// @notice Cumulative fair-curve ETH (after fees) that has flowed through the curve. Buys add, sells subtract.
+    uint256 public ethCum;
+
+    /// @notice Fair-curve circulating supply: tokens that map onto `ethCum` via the forward curve.
+    ///         This is what the inverse curve uses to price sells. Differs from `VULT_TOKEN.totalSupply()`
+    ///         when entropy multipliers have minted bonus tokens.
+    uint256 public totalMintedFair;
+
+    /// @notice Whether the curve has irreversibly entered self-deprecation. After this, no more buys.
+    bool public selfDeprecated;
+
+    /// @notice Whether the pool has been initialized (gates buys to the post-init flow).
+    bool public poolInitialized;
+
+    /// @notice The block of each address's last buy. Used by the same-block cooldown on sells.
+    mapping(address account => uint256 blockNumber) public lastBuyBlock;
+
+    /// @notice Cumulative LP fee revenue (ETH) skimmed by the hook.
+    uint256 public feesAccrued;
+
+    // ---- errors ------------------------------------------------------------
+
+    /// @notice Reverts when a non-PoolManager caller invokes a hook entrypoint.
+    error NotPoolManager();
+    /// @notice Reverts when the pool key does not match the configured ETH/VULT/POOL_FEE pair.
+    error InvalidPool();
+    /// @notice Reverts when an attempt is made to add liquidity directly to the pool.
+    error LiquidityAdditionsForbidden();
+    /// @notice Reverts when the buyer's ETH input exceeds MAX_BUY_WEI.
+    error BuyTooLarge();
+    /// @notice Reverts when a sell occurs within COOLDOWN_BLOCKS of the seller's last buy.
+    error CooldownActive();
+    /// @notice Reverts when buys are attempted after self-deprecation.
+    error SelfDeprecatedNoBuys();
+    /// @notice Reverts when the swap is exact-output (only exact-input is supported).
+    error ExactOutputUnsupported();
+    /// @notice Reverts when `hookData` does not encode an address as the swapper identity.
+    error MissingSwapperInHookData();
+    /// @notice Reverts when the inverse curve would require more ETH than the hook holds.
+    error InsufficientEthReserves();
+   
+
+    // ---- constructor -------------------------------------------------------
+
+    /// @notice Construct the hook. Validates that the deployment address has the correct
+    ///         hook-permission bits encoded in its lowest 14 bits.
+    /// @param poolManager The Uniswap V4 PoolManager.
+    /// @param vultToken The vult ERC-20 token (this hook will be set as its sole minter).
+    /// @param manifesto The 8x32-byte manifesto string, padded with trailing zeros.
+    constructor(IPoolManager poolManager, VultToken vultToken, bytes32[8] memory manifesto ) {
+        POOL_MANAGER = poolManager;
+        VULT_TOKEN = vultToken;
+        ETH_CURRENCY = Currency.wrap(address(0));
+        VULT_CURRENCY = Currency.wrap(address(vultToken));
+        GENESIS_BLOCK = block.number;
+        GENESIS_HASH = blockhash(block.number - 1);
+        for (uint256 i = 0; i < 8; ++i) {
+            _GENESIS_MESSAGE[i] = manifesto[i];
+        }
+
+        // Validate that the deployed address has the hook-permission bits set.
+        // The salt grinder in the deploy script is responsible for finding an address that satisfies this.
+        Hooks.validateHookPermissions(this, getHookPermissions());
+    }
+
+    // ---- view --------------------------------------------------------------
+
+    /// @notice Hook permissions declared for this contract. Mirrored against the address bits.
+    /// @return The 14-bool struct with permissions set as: beforeInitialize, beforeAddLiquidity,
+    ///         beforeSwap, beforeSwapReturnDelta = true; all others = false.
+    function getHookPermissions() public pure returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: true,
+            afterInitialize: false,
+            beforeAddLiquidity: true,
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: false,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: true,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    /// @notice Decode the manifesto into a UTF-8 string by concatenating the eight bytes32 words
+    ///         and trimming trailing null bytes.
+    /// @return The manifesto, exactly as it was at construction.
+    function philosophy() external view returns (string memory) {
+        bytes memory raw = new bytes(256);
+        for (uint256 i = 0; i < 8; ++i) {
+            bytes32 word = _GENESIS_MESSAGE[i];
+            for (uint256 j = 0; j < 32; ++j) {
+                raw[i * 32 + j] = word[j];
+            }
+        }
+        // Trim trailing null bytes.
+        uint256 len = 256;
+        while (len > 0 && raw[len - 1] == 0x00) {
+            unchecked { --len; }
+        }
+        bytes memory trimmed = new bytes(len);
+        for (uint256 k = 0; k < len; ++k) {
+            trimmed[k] = raw[k];
+        }
+        return string(trimmed);
+    }
+
+    /// @notice The ETH balance of this contract, less the accumulated fees.
+    ///         This is the pool of ETH that backs the inverse curve for sells.
+    /// @return The ETH (1e18-scaled) backing sells.
+    function curveReserveEth() external view returns (uint256) {
+        return address(this).balance - feesAccrued;
+    }
+
+    // ---- modifiers ---------------------------------------------------------
+
+    modifier onlyPoolManager() {
+        if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
+        _;
+    }
+
+    // ---- v4 hook entrypoints ----------------------------------------------
+
+    /// @notice Pool-init guard. The pool must be ETH/VULT with the configured fee and this hook.
+    /// @param key The pool key being initialized.
+    /// @return The hook selector if accepted; otherwise reverts.
+    function beforeInitialize(address, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
+        if (Currency.unwrap(key.currency0) != address(0)) revert InvalidPool();
+        if (Currency.unwrap(key.currency1) != address(VULT_TOKEN)) revert InvalidPool();
+        if (key.fee != POOL_FEE) revert InvalidPool();
+        if (address(key.hooks) != address(this)) revert InvalidPool();
+        poolInitialized = true;
+        return IHooks.beforeInitialize.selector;
+    }
+
+    /// @notice Liquidity additions are forbidden forever.
+    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        onlyPoolManager
+        returns (bytes4)
+    {
+        revert LiquidityAdditionsForbidden();
+    }
+
+    /// @notice Core trading entrypoint. Handles buys (ETH→VULT) and sells (VULT→ETH) via the
+    ///         bonding curve, with no AMM liquidity ever present in the pool.
+    /// @dev    Routers must pre-settle the input currency to the PoolManager prior to calling
+    ///         swap (i.e., already hold a positive delta in the input currency in the manager).
+    /// @param key The pool key.
+    /// @param params Swap params; must be exact-input (amountSpecified < 0).
+    /// @param hookData abi.encode(address) of the actual swapper (cooldowns track this address).
+    /// @return selector The hook selector.
+    /// @return delta The BeforeSwapDelta cancelling the AMM-routed portion of the swap and
+    ///               accounting the hook's input/output deltas for end-of-unlock netting.
+    /// @return lpFeeOverride Always zero; this hook does not override LP fees dynamically.
+    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
+        external
+        onlyPoolManager
+        returns (bytes4 selector, BeforeSwapDelta delta, uint24 lpFeeOverride)
+    {
+        if (params.amountSpecified >= 0) revert ExactOutputUnsupported();
+        if (Currency.unwrap(key.currency0) != address(0) || Currency.unwrap(key.currency1) != address(VULT_TOKEN)) {
+            revert InvalidPool();
+        }
+         
+        if (hookData.length < 32) revert MissingSwapperInHookData();
+         address swapper = abi.decode(hookData, (address));
+
+
+        if (params.zeroForOne) {
+            // ETH -> VULT (buy)
+            return _executeBuy(uint256(-params.amountSpecified), swapper);
+        } else {
+            // VULT -> ETH (sell)
+            return _executeSell(uint256(-params.amountSpecified), swapper);
+        }
+    }
+
+    /// @notice Unused. Required to satisfy the IHooks interface even though this hook does not
+    ///         declare permission for it; the V4 manager will never invoke it for this address.
+    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
+        return IHooks.afterInitialize.selector;
+    }
+
+    /// @notice Unused (no permission bit set).
+    function afterAddLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
+    }
+
+    /// @notice Unused (no permission bit set).
+    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return IHooks.beforeRemoveLiquidity.selector;
+    }
+
+    /// @notice Unused (no permission bit set).
+    function afterRemoveLiquidity(
+        address,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external pure returns (bytes4, BalanceDelta) {
+        return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
+    }
+
+    /// @notice Unused (no permission bit set).
+    function afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
+        external
+        pure
+        returns (bytes4, int128)
+    {
+        return (IHooks.afterSwap.selector, int128(0));
+    }
+
+    /// @notice Unused (no permission bit set).
+    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return IHooks.beforeDonate.selector;
+    }
+
+    /// @notice Unused (no permission bit set).
+    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return IHooks.afterDonate.selector;
+    }
+
+    // ---- internal: buy/sell -----------------------------------------------
+
+    /// @dev Execute a buy: mint VULT via curve to the manager (delivered to the buyer through
+    ///      end-of-swap netting), take ETH from the manager (already pre-settled by the router),
+    ///      skim the LP fee, advance the curve.
+    function _executeBuy(uint256 ethIn, address swapper)
+        internal
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        if (ethIn > MAX_BUY_WEI) revert BuyTooLarge();
+        if (selfDeprecated) revert SelfDeprecatedNoBuys();
+
+        uint256 fee = (ethIn * FEE_NUMERATOR) / FEE_DENOMINATOR;
+        uint256 ethToCurve = ethIn - fee;
+
+        uint256 fairVult = Curve.mintFor(ethCum, ethToCurve);
+        uint256 mintAmount = _applyEntropy(fairVult, swapper, ethIn);
+
+        // Mint VULT to the manager so the swap delta routes it to the buyer via take.
+        POOL_MANAGER.sync(VULT_CURRENCY);
+        //VULT_TOKEN.mint(address(POOL_MANAGER), mintAmount);
+        VULT_TOKEN.approve(address(POOL_MANAGER), mintAmount);
+        VULT_TOKEN.transfer(address(POOL_MANAGER), mintAmount);
+        POOL_MANAGER.settle();
+
+        // Take the buyer's ETH from the manager (router has pre-settled).
+        POOL_MANAGER.take(ETH_CURRENCY, address(this), ethIn);
+
+        // Advance state.
+        ethCum += ethToCurve;
+        totalMintedFair += fairVult;
+        feesAccrued += fee;
+        lastBuyBlock[swapper] = block.number;
+
+        // Self-deprecation check (against fair-curve totalMinted, not actual supply).
+        if (
+            totalMintedFair * EXHAUSTION_THRESHOLD_DENOMINATOR
+                >= K_SUPPLY * EXHAUSTION_THRESHOLD_NUMERATOR
+        ) {
+            selfDeprecated = true;
+        }
+
+        // BeforeSwapDelta: specified=+ethIn cancels swap; unspecified=-mintAmount routes VULT to buyer.
+        BeforeSwapDelta delta = toBeforeSwapDelta(int128(int256(ethIn)), -int128(int256(mintAmount)));
+        return (IHooks.beforeSwap.selector, delta, 0);
+    }
+
+    /// @dev Execute a sell: take VULT from the manager (router has pre-settled), burn it,
+    ///      pay ETH from the hook's curve reserves to the manager (delivered to seller through
+    ///      end-of-swap netting), skim the LP fee, retract the curve.
+    function _executeSell(uint256 vultIn, address swapper)
+        internal
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        // Same-block cooldown vs this seller's last buy.
+        uint256 lastBlock = lastBuyBlock[swapper];
+        if (lastBlock != 0 && (block.number - lastBlock) < COOLDOWN_BLOCKS) revert CooldownActive();
+
+        // Convert the seller's actual tokens into fair-curve units. This decouples sells
+        // from entropy multipliers so the inverse curve always references the canonical
+        // curve position recorded in `totalMintedFair`. Entropy bonuses at buy time end up
+        // priced into the per-token sell value of every holder uniformly.
+        uint256 actualSupply = VULT_TOKEN.totalSupply();
+        uint256 vultFairIn = (vultIn * totalMintedFair) / actualSupply;
+        if (vultFairIn > totalMintedFair) vultFairIn = totalMintedFair;
+
+        // Inverse curve: how much ETH does the curve owe for these tokens (pre-fee).
+        uint256 ethRaw = Curve.burnFor(totalMintedFair, vultFairIn);
+        uint256 fee = (ethRaw * FEE_NUMERATOR) / FEE_DENOMINATOR;
+        uint256 ethOut = ethRaw - fee;
+
+        if (address(this).balance < ethOut) revert InsufficientEthReserves();
+
+        // Take VULT from manager (router pre-settled) and burn it.
+        POOL_MANAGER.take(VULT_CURRENCY, address(this), vultIn);
+        //VULT_TOKEN.burn(address(this), vultIn);
+        VULT_TOKEN.transfer(0x000000000000000000000000000000000000dEaD, vultFairIn);
+
+        // Pay ETH out to manager so the swap delta routes it to the seller via take.
+        POOL_MANAGER.settle{value: ethOut}();
+
+        // Retract the curve.
+        if (ethRaw <= ethCum) {
+            ethCum -= ethRaw;
+        } else {
+            ethCum = 0;
+        }
+        totalMintedFair -= vultFairIn;
+        feesAccrued += fee;
+
+        // BeforeSwapDelta: specified=+vultIn cancels swap; unspecified=-ethOut routes ETH to seller.
+        BeforeSwapDelta delta = toBeforeSwapDelta(int128(int256(vultIn)), -int128(int256(ethOut)));
+        return (IHooks.beforeSwap.selector, delta, 0);
+    }
+
+    /// @dev If we're inside the entropy window, scale `fairVult` by a multiplier in [0.9, 1.1]
+    ///      derived from blockhash, the swapper, and the input amount.
+    function _applyEntropy(uint256 fairVult, address swapper, uint256 ethIn) internal view returns (uint256) {
+        if (block.number >= GENESIS_BLOCK + ENTROPY_BLOCKS) return fairVult;
+        bytes32 h = keccak256(abi.encodePacked(blockhash(block.number - 1), swapper, ethIn));
+        uint256 mul = 9000 + (uint256(h) % 2001); // 9000..11000, in 1e-4 units
+        return (fairVult * mul) / 10000;
+    }
+
+    // ---- ETH receive -------------------------------------------------------
+
+    /// @notice Accept ETH from the PoolManager (via take) and from buyers' settled funds.
+    ///         No other purpose; do not send ETH to this contract directly.
+    receive() external payable {}
+}
